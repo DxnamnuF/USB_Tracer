@@ -1,105 +1,196 @@
-import winreg
+from datetime import datetime, timedelta, timezone
+
+try:
+    import winreg
+except ImportError:
+    winreg = None
+
+USBSTOR_PATH = r"SYSTEM\CurrentControlSet\Enum\USBSTOR"
+WPD_PATH = r"SOFTWARE\Microsoft\Windows Portable Devices\Devices"
+
 
 def is_generated_serial(serial: str) -> bool:
-    """Проверяет, сгенерирован ли серийный номер системой (наличие '&' на второй позиции)."""
-    return len(serial) > 1 and serial[1] == '&'
+    """Винда ставит & вторым символом, если серийник выдумала сама"""
+    return len(serial) > 1 and serial[1] == "&"
 
-def get_registry_value(key, value_name):
-    """Безопасное извлечение значения из ключа реестра."""
+
+def filetime_to_utc(value):
+    """FILETIME из реестра переводим в нормальную дату"""
+    if not value:
+        return None
+    try:
+        dt = datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=value / 10)
+        return dt.isoformat().replace("+00:00", "Z")
+    except Exception:
+        return None
+
+
+def get_registry_value(key, value_name, default=None):
+    """Берём значение, если его нет — ругаемся"""
     try:
         return winreg.QueryValueEx(key, value_name)[0]
     except FileNotFoundError:
+        return default
+    except OSError:
+        return default
+
+
+def enum_subkeys(key):
+    """С писок подпапок в ключе реестра"""
+    count = winreg.QueryInfoKey(key)[0]
+    for i in range(count):
+        try:
+            yield winreg.EnumKey(key, i)
+        except OSError:
+            continue
+
+
+def key_last_write_utc(key):
+    """Это время последнего изменения ключа, а не время подключения :( """
+    try:
+        return filetime_to_utc(winreg.QueryInfoKey(key)[2])
+    except OSError:
         return None
 
+
+def clean_descriptor_part(text):
+    if not text:
+        return None
+    return text.replace("_", " ").strip() or None
+
+
+def parse_device_descriptor(device_str: str) -> dict:
+    """Парсим строку вида Disk&Ven_...&Prod_...&Rev_..."""
+    parsed = {
+        "device_type": None,
+        "vendor": None,
+        "product": None,
+        "revision": None,
+    }
+
+    parts = device_str.split("&")
+    if parts:
+        parsed["device_type"] = clean_descriptor_part(parts[0])
+
+    prefixes = {
+        "VEN_": "vendor",
+        "PROD_": "product",
+        "REV_": "revision",
+    }
+
+    for part in parts[1:]:
+        upper = part.upper()
+        for prefix, field in prefixes.items():
+            if upper.startswith(prefix):
+                parsed[field] = clean_descriptor_part(part[len(prefix):])
+                break
+
+    return parsed
+
+
 def get_wpd_data():
-    """
-    Парсит ветку Windows Portable Devices.
-    Возвращает словарь, где ключ — часть ID устройства, а значение — FriendlyName.
-    """
-    wpd_map = {}
-    wpd_path = r"SOFTWARE\Microsoft\Windows Portable Devices\Devices"
+    """Читаем WPD, там лежит нормальное имя"""
+    if winreg is None:
+        return []
+
+    devices = []
     try:
-        # Ветка WPD находится в HKEY_LOCAL_MACHINE
-        base_key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, wpd_path)
-        num_devices = winreg.QueryInfoKey(base_key)[0]
-        
-        for i in range(num_devices):
-            device_id = winreg.EnumKey(base_key, i)
-            with winreg.OpenKey(base_key, device_id) as subkey:
-                friendly_name = get_registry_value(subkey, "FriendlyName")
-                if friendly_name:
-                    # Сохраняем под коротким ключом (серийником), чтобы сопоставить с USBSTOR
-                    wpd_map[device_id.upper()] = friendly_name
-        winreg.CloseKey(base_key)
-    except Exception:
-        pass  # Ветка может отсутствовать, если устройства не подключались
-    return wpd_map
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, WPD_PATH) as base_key:
+            for device_id in enum_subkeys(base_key):
+                try:
+                    with winreg.OpenKey(base_key, device_id) as subkey:
+                        friendly_name = get_registry_value(subkey, "FriendlyName")
+                        device_desc = get_registry_value(subkey, "DeviceDesc")
+                        label = get_registry_value(subkey, "Label")
+                        devices.append({
+                            "device_id": device_id,
+                            "device_id_upper": device_id.upper(),
+                            "friendly_name": friendly_name or label or device_desc,
+                        })
+                except OSError:
+                    continue
+    except OSError:
+        pass
+
+    return devices
+
+
+def find_wpd_match(instance_str: str, wpd_devices: list):
+    """Ищем WPD-запись, где внутри есть серийник из USBSTOR"""
+    instance_upper = instance_str.upper()
+    for item in wpd_devices:
+        if instance_upper in item["device_id_upper"]:
+            return item
+    return None
+
 
 def get_usbstor_data():
-    """Парсит ветку USBSTOR и обогащает данные через WPD."""
+    """Главная функция. USBSTOR + немного WPD"""
+    if winreg is None:
+        return [{
+            "error": "Czy naprawde jeseś teraz na windowsie?"
+        }]
+
     results = []
-    base_key_path = r"SYSTEM\CurrentControlSet\Enum\USBSTOR"
-    
-    # Получаем данные из WPD для корреляции
     wpd_cache = get_wpd_data()
-    
+
     try:
-        base_key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base_key_path)
-    except Exception as e:
-        return [{"error": f"Ошибка доступа к USBSTOR: {e}"}]
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, USBSTOR_PATH) as base_key:
+            for device_str in enum_subkeys(base_key):
+                device_info = parse_device_descriptor(device_str)
 
-    num_devices = winreg.QueryInfoKey(base_key)[0]
-    
-    for i in range(num_devices):
-        try:
-            device_str = winreg.EnumKey(base_key, i)
-            device_key_path = f"{base_key_path}\\{device_str}"
-            device_key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, device_key_path)
-            
-            num_instances = winreg.QueryInfoKey(device_key)[0]
-            
-            for j in range(num_instances):
-                instance_str = winreg.EnumKey(device_key, j)
-                instance_key_path = f"{device_key_path}\\{instance_str}"
-                instance_key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, instance_key_path)
-                
-                # 1. Пытаемся взять FriendlyName из USBSTOR
-                friendly_name = get_registry_value(instance_key, "FriendlyName")
-                
-                # 2. Если в USBSTOR пусто, ищем в кэше WPD по вхождению серийного номера в ID
-                if not friendly_name:
-                    for wpd_id, name in wpd_cache.items():
-                        if instance_str.upper() in wpd_id:
-                            friendly_name = f"{name} (из WPD)"
-                            break
-                
-                if not friendly_name:
-                    friendly_name = "Неизвестное устройство"
+                try:
+                    with winreg.OpenKey(base_key, device_str) as device_key:
+                        for instance_str in enum_subkeys(device_key):
+                            try:
+                                with winreg.OpenKey(device_key, instance_str) as instance_key:
+                                    friendly_name = get_registry_value(instance_key, "FriendlyName")
+                                    friendly_source = "USBSTOR" if friendly_name else None
 
-                parent_id_prefix = get_registry_value(instance_key, "ParentIdPrefix") or "Не найден"
-                generated_flag = is_generated_serial(instance_str)
+                                    wpd_match = find_wpd_match(instance_str, wpd_cache)
+                                    if not friendly_name and wpd_match and wpd_match.get("friendly_name"):
+                                        friendly_name = wpd_match["friendly_name"]
+                                        friendly_source = "WPD"
 
-                results.append({
-                    "vendor_product": device_str,
-                    "serial": instance_str,
-                    "friendly_name": friendly_name,
-                    "is_generated": generated_flag,
-                    "parent_id_prefix": parent_id_prefix
-                })
-                winreg.CloseKey(instance_key)
-            winreg.CloseKey(device_key)
-        except OSError:
-            continue 
-            
-    winreg.CloseKey(base_key)
+                                    if not friendly_name:
+                                        friendly_name = "Unknown :("
+                                        friendly_source = "fallback"
+
+                                    results.append({
+                                        "artifact_source": fr"HKLM\{USBSTOR_PATH}\{device_str}\{instance_str}",
+                                        "vendor_product": device_str,
+                                        "device_type": device_info["device_type"],
+                                        "vendor": device_info["vendor"],
+                                        "product": device_info["product"],
+                                        "revision": device_info["revision"],
+                                        "serial": instance_str,
+                                        "friendly_name": friendly_name,
+                                        "friendly_name_source": friendly_source,
+                                        "wpd_match": bool(wpd_match),
+                                        "wpd_device_id": wpd_match["device_id"] if wpd_match else None,
+                                        "is_generated": is_generated_serial(instance_str),
+                                        "parent_id_prefix": get_registry_value(instance_key, "ParentIdPrefix", "sirotka"),
+                                        "container_id": get_registry_value(instance_key, "ContainerID"),
+                                        "class_guid": get_registry_value(instance_key, "ClassGUID"),
+                                        "hardware_id": get_registry_value(instance_key, "HardwareID", []),
+                                        "last_write_utc": key_last_write_utc(instance_key),
+                                    })
+                            except OSError:
+                                continue
+                except OSError:
+                    continue
+    except PermissionError as e:
+        return [{"error": f"Spróbuj admina, nie masz dostępu do USBSTOR: {e}"}]
+    except OSError as e:
+        return [{"error": f"USBSTOR nie otwarzaa się: {e}"}]
+
     return results
 
-# Пример вывода
+
 if __name__ == "__main__":
-    data = get_usbstor_data()
-    for item in data:
-        status = "[GEN]" if item.get("is_generated") else "[HW]"
-        print(f"{status} {item['vendor_product']}")
-        print(f"    SN: {item['serial']}")
-        print(f"    Name: {item['friendly_name']}")
-        print(f"    ParentPrefix: {item['parent_id_prefix']}\n")
+    for item in get_usbstor_data():
+        if "error" in item:
+            print(item["error"])
+            continue
+        status = "GEN" if item["is_generated"] else "HW"
+        print(f"[{status}] {item['friendly_name']} | {item['serial']} | {item['last_write_utc']}")
