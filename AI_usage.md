@@ -1,6 +1,6 @@
 # Wykorzystanie sztucznej inteligencji w projekcie USB_Tracer
 
-Sztuczna inteligencja (AI) była wykorzystywana jako narzędzie wspomagające przygotowywanie wstępnych wersji kodu, wykonywanie powtarzalnych zadań i opracowywanie dokumentacji. Poniższe zestawienie powstało na podstawie udostępnionego opisu procesu rozwoju oraz rozmów dotyczących projektu; nie rozstrzyga ono autorstwa poszczególnych linii kodu ani modułów.
+Sztuczna inteligencja była wykorzystywana jako narzędzie wspomagające przygotowywanie wstępnych wersji kodu, wykonywanie powtarzalnych zadań i opracowywanie dokumentacji. Poniższe zestawienie powstało na podstawie udostępnionego opisu procesu rozwoju oraz rozmów dotyczących projektu.
 
 ## Tworzenie i udoskonalanie kodu
 
