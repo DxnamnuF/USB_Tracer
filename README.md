@@ -1,4 +1,5 @@
 # DFIR_project
+Program jest zrobiony za pomocą AI
 
 DFIR_project is a lightweight Windows DFIR helper for building USB-related timelines from forensic artifacts.
 
