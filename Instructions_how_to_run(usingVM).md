@@ -7,7 +7,7 @@ The purpose is not only to check that the program runs, but to create a repeatab
 1. the investigator knows exactly which USB events occurred;
 2. the Windows VM is shut down before evidence collection;
 3. the virtual disk is preserved as evidence;
-4. Windows forensic artefacts are extracted from the disk without modifying the guest system;
+4. Windows forensic artefacts are read from a mounted working image without booting or modifying the guest system;
 5. USB_Tracer analyses the offline artefacts;
 6. the output is compared with the known test timeline and, optionally, with another forensic tool.
 
@@ -21,32 +21,13 @@ USB_Tracer does **not** need to boot the acquired Windows system and it should n
 
 The current main workflow is:
 
-```text
-Windows VM
-    |
-    | controlled USB activity
-    v
-VM shutdown
-    |
-    v
-Virtual disk copy / forensic image
-    |
-    v
-Read-only examination / artefact extraction
-    |
-    +--> SYSTEM hive
-    +--> SOFTWARE hive
-    +--> NTUSER.DAT
-    +--> optional EVTX files
-    +--> optional setupapi.dev.log
-    +--> optional LNK / Jump List artefacts
-    |
-    v
-USB_Tracer
-    |
-    v
-HTML / JSON / CSV / DOT reports
-```
+1. Perform controlled USB activity in the Windows VM.
+2. Shut down the VM and preserve its complete disk set.
+3. Convert the current VirtualBox disk state to a separate VHD working image.
+4. Mount the VHD read-only on the Windows host and locate its Windows partition.
+5. Pass explicit paths to the mounted Registry hives and other artefacts to USB_Tracer.
+6. Save HTML, JSON, CSV, or DOT reports outside the mounted image.
+7. Compare the results with the recorded activity and dismount the VHD.
 
 The auxiliary `--mode live` mode reads artefacts from the currently running Windows system. It is useful for development and comparison, but it is **not the mode for forensic evidence validation**.
 
@@ -56,7 +37,7 @@ The auxiliary `--mode live` mode reads artefacts from the currently running Wind
 
 Use a Windows host machine and create a separate Windows VM.
 
-The exact hypervisor is not critical. VMware Workstation, VirtualBox, Hyper-V, or another hypervisor may be used.
+The procedure below uses VirtualBox on a Windows host, including its VBoxManage utility to convert a VDI disk to VHD. Other hypervisors require an appropriate disk preparation procedure before the same offline artefact analysis can be performed.
 
 The important requirement is that the hypervisor allows a physical USB device to be connected directly to the guest Windows VM.
 
@@ -113,7 +94,7 @@ Do this before starting the VM experiment. It confirms that the local USB_Tracer
 
 Create a new Windows VM in your hypervisor.
 
-Use a dynamically allocated virtual disk if desired. The disk format itself is not important for the experiment because a preserved copy can later be converted to a raw forensic image.
+Use a VDI virtual disk; dynamically allocated storage is suitable. After the experiment, create a VHD working image that Windows can mount read-only. RAW conversion and qemu-img are not required for this procedure.
 
 Suggested naming:
 
@@ -232,294 +213,228 @@ Confirm in the hypervisor that the VM state is:
 Powered Off
 ```
 
-This is important because the virtual disk should no longer be changing when it is preserved.
+This is important because the virtual disk should no longer be changing when it is preserved. Close the VM window and VirtualBox Manager after shutdown to release any disk handles. Run the remaining commands on the host, in the same PowerShell session. Use an elevated PowerShell session for mounting and dismounting the VHD.
 
 ---
 
-# 9. Preserve the virtual disk
+# 9. Locate and preserve the complete virtual disk set
 
-Locate the VM virtual disk on the host.
-
-Common extensions are:
-
-```text
-.vmdk   VMware
-.vdi    VirtualBox
-.vhdx   Hyper-V
-```
-
-Example:
-
-```text
-USB-Tracer-Test.vmdk
-```
-
-Do not analyse the only original copy.
-
-Create an evidence directory:
+Set the VM name and directories to match your host. The example uses the VM name from section 4:
 
 ```powershell
-mkdir C:\DFIR_Case
-mkdir C:\DFIR_Case\Original
-mkdir C:\DFIR_Case\Working
-mkdir C:\DFIR_Case\Extracted
-mkdir C:\DFIR_Case\Reports
+$vmName = "USB-Tracer-Test"
+$vmDir = "C:\Users\pance\VirtualBox VMs\USB-Tracer-Test"
+$caseDir = "C:\DFIR_Case"
+$outDir = Join-Path $caseDir "Working"
+$reportDir = Join-Path $caseDir "Reports"
+$originalDir = Join-Path $caseDir "Original"
+$vbox = "C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"
+
+New-Item -ItemType Directory -Path $outDir, $reportDir, $originalDir -Force | Out-Null
+& $vbox showvminfo $vmName --details
+Get-ChildItem -LiteralPath $vmDir -Recurse -Filter *.vdi |
+    Select-Object FullName, Length
 ```
 
-Copy the powered-off VM disk into `Original`.
+Identify the disk attached to the VM's **current state**, using the storage information shown by `showvminfo` or the VM's storage settings. A snapshot disk can depend on several parent images. Choosing the largest VDI does not reliably identify the current state.
 
-Example:
+Preserve the complete powered-off VM folder before conversion:
 
 ```powershell
-Copy-Item "C:\VMs\USB-Tracer-Test\USB-Tracer-Test.vmdk" `
-          "C:\DFIR_Case\Original\USB-Tracer-Test.vmdk"
+$preservedVm = Join-Path $originalDir "USB-Tracer-Test"
+if (Test-Path -LiteralPath $preservedVm) {
+    throw "The evidence folder already exists. Use a new case directory."
+}
+Copy-Item -LiteralPath $vmDir -Destination $preservedVm -Recurse -ErrorAction Stop
 ```
 
-Then make a working copy:
-
-```powershell
-Copy-Item "C:\DFIR_Case\Original\USB-Tracer-Test.vmdk" `
-          "C:\DFIR_Case\Working\USB-Tracer-Test.vmdk"
-```
-
-The `Original` copy should not be modified during testing.
+If a disk or parent image is stored outside the VM folder, preserve it as well and record its location. Keep all parents accessible to VirtualBox during conversion. Do not boot the preserved copy or delete, merge, or rearrange its snapshot files.
 
 ---
 
-# 10. Calculate a SHA-256 hash
+# 10. Record SHA-256 hashes
 
-Hash the preserved original disk:
-
-```powershell
-Get-FileHash "C:\DFIR_Case\Original\USB-Tracer-Test.vmdk" -Algorithm SHA256
-```
-
-Save the result.
-
-Example:
-
-```text
-Algorithm : SHA256
-Hash      : 0123456789ABCDEF...
-Path      : C:\DFIR_Case\Original\USB-Tracer-Test.vmdk
-```
-
-You can save it directly:
+Hash all preserved VDI files and write the manifest outside the preserved VM folder:
 
 ```powershell
-Get-FileHash "C:\DFIR_Case\Original\USB-Tracer-Test.vmdk" -Algorithm SHA256 |
-    Out-File "C:\DFIR_Case\Original\SHA256.txt"
+Get-ChildItem -LiteralPath $preservedVm -Recurse -File -Filter *.vdi |
+    Get-FileHash -Algorithm SHA256 |
+    Export-Csv (Join-Path $originalDir "SHA256.csv") -NoTypeInformation
 ```
 
-This provides an integrity reference for the preserved evidence copy.
+Also hash any preserved disk dependencies stored elsewhere. These values provide an integrity reference for the original evidence set. The converted VHD is a separate working image and will have a different hash.
 
 ---
 
-# 11. Convert the VM disk to RAW
+# 11. Convert the current VDI state to VHD
 
-USB_Tracer itself primarily analyses extracted Windows artefacts, so conversion to RAW is not mandatory.
-
-However, converting the VM disk to a raw image is useful if you want a more conventional forensic disk-image workflow.
-
-With `qemu-img`, the concept is:
-
-```text
-VMDK / VDI / VHDX
-        |
-        v
-     qemu-img
-        |
-        v
-    evidence.raw
-```
-
-Examples:
-
-For VMDK:
+Set `$src` to the exact attached disk identified in section 9. The example below is for a VM without snapshot dependencies; when snapshots exist, replace it with the current attached child image path. VirtualBox must be able to resolve its parent chain.
 
 ```powershell
-qemu-img convert -p -f vmdk -O raw `
-    "C:\DFIR_Case\Working\USB-Tracer-Test.vmdk" `
-    "C:\DFIR_Case\Working\USB-Tracer-Test.raw"
+$src = "C:\Users\pance\VirtualBox VMs\USB-Tracer-Test\USB-Tracer-Test.vdi"
+$vhd = Join-Path $outDir "USB-Tracer-Test.vhd"
+
+if (-not (Test-Path -LiteralPath $src)) { throw "Source VDI not found: $src" }
+if (Test-Path -LiteralPath $vhd) { throw "VHD already exists. Choose a new output name." }
+
+& $vbox clonemedium disk $src $vhd --format VHD
+if ($LASTEXITCODE -ne 0) { throw "VDI-to-VHD conversion failed." }
 ```
 
-For VDI:
-
-```powershell
-qemu-img convert -p -f vdi -O raw `
-    "C:\DFIR_Case\Working\USB-Tracer-Test.vdi" `
-    "C:\DFIR_Case\Working\USB-Tracer-Test.raw"
-```
-
-For VHDX:
-
-```powershell
-qemu-img convert -p -f vhdx -O raw `
-    "C:\DFIR_Case\Working\USB-Tracer-Test.vhdx" `
-    "C:\DFIR_Case\Working\USB-Tracer-Test.raw"
-```
-
-Always convert the **working copy**, not the preserved original.
+Wait for the operation to reach 100% and complete successfully. This reads the powered-off source disk and creates a separate VHD; keep the preserved evidence set unchanged. Do not automatically delete an existing output image when repeating the procedure.
 
 ---
 
-# 12. Extract the Windows forensic artefacts
+# 12. Mount the VHD read-only
 
-The next objective is to obtain the offline Windows artefacts that USB_Tracer can analyse.
+Run on the Windows host in PowerShell as administrator:
 
-At minimum, extract:
-
-```text
-Windows\System32\config\SYSTEM
-Windows\System32\config\SOFTWARE
-Users\<username>\NTUSER.DAT
+```powershell
+Mount-DiskImage -ImagePath $vhd -Access ReadOnly -ErrorAction Stop
+Get-DiskImage -ImagePath $vhd | Get-Disk | Get-Partition | Get-Volume
 ```
 
-For the example VM:
-
-```text
-Windows\System32\config\SYSTEM
-Windows\System32\config\SOFTWARE
-Users\forensic-test\NTUSER.DAT
-```
-
-Place them in:
-
-```text
-C:\DFIR_Case\Extracted\Registry\
-```
-
-For example:
-
-```text
-C:\DFIR_Case\Extracted\Registry\SYSTEM
-C:\DFIR_Case\Extracted\Registry\SOFTWARE
-C:\DFIR_Case\Extracted\Users\forensic-test\NTUSER.DAT
-```
-
-Use a forensic image viewer or another method that allows the disk/image to be examined without booting the acquired Windows installation.
-
-The hives should be copied from the offline filesystem.
+The image now appears as a disk on the host. Keep it mounted throughout analysis. Do not initialise, format, or repair its partitions if Windows prompts you to do so.
 
 ---
 
-# 13. Additional artefacts to extract
+# 13. Locate the Windows partition and user profiles
 
-USB_Tracer can use more than the core registry hives.
+Search only volumes belonging to this mounted image for the offline SYSTEM hive:
 
-Depending on which features you want to validate, also extract Windows event logs and additional artefacts.
+```powershell
+$volumes = Get-DiskImage -ImagePath $vhd | Get-Disk | Get-Partition | Get-Volume
+$windowsVolumes = @($volumes | Where-Object {
+    $_.DriveLetter -and
+    (Test-Path -LiteralPath "$($_.DriveLetter):\Windows\System32\config\SYSTEM")
+})
 
-Typical locations include:
-
-```text
-Windows\System32\winevt\Logs\
-Windows\inf\setupapi.dev.log
-Users\<username>\AppData\Roaming\Microsoft\Windows\Recent\
+if ($windowsVolumes.Count -ne 1) {
+    throw "Expected one accessible Windows partition. Inspect the image's volumes and select the correct partition."
+}
+$root = "$($windowsVolumes[0].DriveLetter):\"
+$root
 ```
 
-For the project workflow, useful inputs may include:
+For example, `$root` may contain `E:\`. This is the host's current mount letter, not necessarily the drive letter used inside the guest. If no Windows partition is found, check whether it has a drive letter and whether BitLocker is locked before continuing.
 
-- offline `.evtx` files;
-- `setupapi.dev.log`;
-- LNK files;
-- Jump Lists;
-- multiple users' `NTUSER.DAT` hives.
+List the available user profiles:
 
-Do not rename the original extracted artefacts unless necessary. It is easier to preserve provenance when paths and filenames remain recognizable.
+```powershell
+Get-ChildItem -LiteralPath (Join-Path $root "Users") -Directory -Force |
+    Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "NTUSER.DAT") } |
+    Select-Object FullName
+
+$guestUser = "forensic-test"
+$userDir = Join-Path $root "Users\$guestUser"
+```
+
+Replace `forensic-test` with the user who performed the experiment. `NTUSER.DAT` is normally hidden. The relevant artefacts can be read directly from the mounted filesystem; copying them into an `Extracted` directory is optional.
+
+| Artefact | Path relative to the mounted Windows partition |
+| --- | --- |
+| SYSTEM | `Windows\System32\config\SYSTEM` |
+| SOFTWARE | `Windows\System32\config\SOFTWARE` |
+| User hive | `Users\<username>\NTUSER.DAT` |
+| System event log | `Windows\System32\winevt\Logs\System.evtx` |
+| Kernel-PnP event log | `Windows\System32\winevt\Logs\Microsoft-Windows-Kernel-PnP%4Configuration.evtx` |
+| Device installation log | `Windows\inf\setupapi.dev.log` |
+| Recent shortcuts | `Users\<username>\AppData\Roaming\Microsoft\Windows\Recent` |
+| Automatic Jump Lists | `Users\<username>\AppData\Roaming\Microsoft\Windows\Recent\AutomaticDestinations` |
+| Custom Jump Lists | `Users\<username>\AppData\Roaming\Microsoft\Windows\Recent\CustomDestinations` |
 
 ---
 
-# 14. Run USB_Tracer in the primary offline mode
+# 14. Analyse the mounted Registry hives
 
-Return to the USB_Tracer project directory:
-
-```powershell
-cd C:\Users\pance\Downloads\DFIR_project\DFIR_project
-```
-
-Run the main offline analysis:
+Return to the project directory on the host:
 
 ```powershell
-python main.py `
-  --system-hive "C:\DFIR_Case\Extracted\Registry\SYSTEM" `
-  --software-hive "C:\DFIR_Case\Extracted\Registry\SOFTWARE" `
-  --ntuser-hive "C:\DFIR_Case\Extracted\Users\forensic-test\NTUSER.DAT" `
-  --html "C:\DFIR_Case\Reports\report.html"
+Set-Location "C:\Users\pance\Downloads\DFIR_project\DFIR_project"
+python .\main.py --help
 ```
 
-This is the preferred mode for the VM forensic test.
+Pass explicit artifact paths to the default offline hive mode:
+
+```powershell
+python .\main.py `
+  --system-hive (Join-Path $root "Windows\System32\config\SYSTEM") `
+  --software-hive (Join-Path $root "Windows\System32\config\SOFTWARE") `
+  --ntuser-hive (Join-Path $userDir "NTUSER.DAT") `
+  --html (Join-Path $reportDir "registry_report.html")
+```
+
+The CLI reads the files from the mounted image. It does not automatically discover the whole Windows installation. At least one offline Registry hive is required; remove an optional input argument if its file is absent. Keep reports in `$reportDir` on the host, outside the mounted image.
 
 ---
 
-# 15. Multiple Windows users
+# 15. Analyse multiple Windows users
 
-If the image contains several user profiles, provide multiple `--ntuser-hive` arguments.
-
-Conceptually:
+Repeat `--ntuser-hive` for the profiles you want to investigate:
 
 ```powershell
-python main.py `
-  --system-hive "C:\DFIR_Case\Extracted\Registry\SYSTEM" `
-  --software-hive "C:\DFIR_Case\Extracted\Registry\SOFTWARE" `
-  --ntuser-hive "C:\DFIR_Case\Extracted\Users\User1\NTUSER.DAT" `
-  --ntuser-hive "C:\DFIR_Case\Extracted\Users\User2\NTUSER.DAT" `
-  --html "C:\DFIR_Case\Reports\report.html"
+python .\main.py `
+  --system-hive (Join-Path $root "Windows\System32\config\SYSTEM") `
+  --software-hive (Join-Path $root "Windows\System32\config\SOFTWARE") `
+  --ntuser-hive (Join-Path $root "Users\User1\NTUSER.DAT") `
+  --ntuser-hive (Join-Path $root "Users\User2\NTUSER.DAT") `
+  --html (Join-Path $reportDir "multi_user_report.html")
 ```
 
-This allows user-specific artefacts to be correlated with system-wide USB information.
+Replace `User1` and `User2` with actual profile names. This allows user-specific artefacts to be correlated with system-wide USB information.
 
 ---
 
-# 16. Add other offline evidence
+# 16. Include logs and file activity in the offline analysis
 
-After the basic registry-only test works, extend the command with additional evidence sources supported by the current CLI.
-
-Examples of supported input types include:
-
-```text
---evtx
---setupapi-log
---lnk-dir
---jump-list-dir
-```
-
-Always confirm the exact current syntax with:
+After the basic hive analysis works, include the other available artefacts. The following example assumes all listed files and directories exist:
 
 ```powershell
-python main.py --help
+$recentDir = Join-Path $userDir "AppData\Roaming\Microsoft\Windows\Recent"
+
+python .\main.py `
+  --mode hive `
+  --system-hive (Join-Path $root "Windows\System32\config\SYSTEM") `
+  --software-hive (Join-Path $root "Windows\System32\config\SOFTWARE") `
+  --ntuser-hive (Join-Path $userDir "NTUSER.DAT") `
+  --evtx (Join-Path $root "Windows\System32\winevt\Logs\System.evtx") `
+  --evtx (Join-Path $root "Windows\System32\winevt\Logs\Microsoft-Windows-Kernel-PnP%4Configuration.evtx") `
+  --setupapi-log (Join-Path $root "Windows\inf\setupapi.dev.log") `
+  --include-file-activity `
+  --lnk-dir $recentDir `
+  --jump-list-dir (Join-Path $recentDir "AutomaticDestinations") `
+  --jump-list-dir (Join-Path $recentDir "CustomDestinations") `
+  --max-events 20000 `
+  --html (Join-Path $reportDir "disk_report.html") `
+  --json (Join-Path $reportDir "disk_timeline.json") `
+  --csv (Join-Path $reportDir "disk_timeline.csv") `
+  --summary-csv (Join-Path $reportDir "disk_summary.csv") `
+  --graph-dot (Join-Path $reportDir "disk_graph.dot")
 ```
 
-A typical extended analysis should include the SYSTEM and SOFTWARE hives first, then user hives, and then supplementary artefacts.
+Remove each argument whose source is absent. For additional users, repeat both their hive and directory arguments. Do not enable host live-event or live-user options when analysing this offline image. EVTX parsing uses Windows PowerShell. `--max-events` limits the number of events read from each EVTX file; increase it if the test records fall outside that limit.
 
-The objective is to allow USB_Tracer to correlate evidence from several independent Windows sources instead of relying on one registry key alone.
+PowerShell's backtick at the end of a line continues the command. It must be the last character on that line.
 
 ---
 
-# 17. Export all useful report formats
+# 17. Open the reports and dismount the image
 
-For testing, generate more than only the HTML report.
-
-The current project supports output options including:
-
-```text
---html
---json
---csv
---summary-csv
---graph-dot
-```
-
-Use the HTML report for manual inspection.
-
-Use JSON/CSV for checking exact parsed fields and for automated comparison.
-
-Use the DOT graph output when testing relationships between devices, volumes, users, and artefacts.
-
-Check the current CLI before running:
+After the analysis completes successfully, open the HTML report:
 
 ```powershell
-python main.py --help
+Start-Process (Join-Path $reportDir "disk_report.html")
 ```
+
+Use HTML for manual inspection, JSON/CSV for checking parsed fields, and DOT for examining relationships. Compare the reported artefacts with the known test activity as described in section 18.
+
+When no further reading from the image is required, dismount it from the same elevated PowerShell session:
+
+```powershell
+Dismount-DiskImage -ImagePath $vhd -ErrorAction Stop
+```
+
+The reports remain available on the host after the VHD is dismounted.
 
 ---
 
